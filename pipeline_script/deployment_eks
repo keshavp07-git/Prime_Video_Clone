@@ -1,0 +1,206 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            name: 'AWS_REGION',
+            defaultValue: 'ap-southeast-2',
+            description: 'AWS region'
+        )
+
+        string(
+            name: 'AWS_ACCOUNT_ID',
+            defaultValue: '777035565509',
+            description: 'New AWS account ID'
+        )
+
+        string(
+            name: 'ECR_REPO_NAME',
+            defaultValue: 'amazon-prime',
+            description: 'ECR repository name'
+        )
+
+        string(
+            name: 'VERSION',
+            defaultValue: 'latest',
+            description: 'Image tag, e.g. latest or BUILD_NUMBER'
+        )
+
+        string(
+            name: 'CLUSTER_NAME',
+            defaultValue: 'amazon-prime-cluster',
+            description: 'EKS cluster name'
+        )
+    }
+
+    stages {
+        stage('1. Clone GitHub Repository') {
+            steps {
+                git branch: 'main',
+                    url: 'https://github.com/pandacloud1/DevopsProject2.git'
+            }
+        }
+
+        stage('2. Verify AWS Account and Login to EKS') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'access-key',
+                        variable: 'AWS_ACCESS_KEY_ID'
+                    ),
+                    string(
+                        credentialsId: 'secret-key',
+                        variable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+                        export AWS_DEFAULT_REGION="$AWS_REGION"
+                        export AWS_PAGER=""
+
+                        ACTUAL_ACCOUNT=$(aws sts get-caller-identity \
+                            --query Account --output text)
+
+                        echo "Authenticated AWS account: $ACTUAL_ACCOUNT"
+
+                        if [ "$ACTUAL_ACCOUNT" != "$AWS_ACCOUNT_ID" ]; then
+                            echo "ERROR: Expected account $AWS_ACCOUNT_ID."
+                            exit 1
+                        fi
+
+                        aws eks describe-cluster \
+                            --name "$CLUSTER_NAME" \
+                            --region "$AWS_REGION"
+
+                        aws eks update-kubeconfig \
+                            --region "$AWS_REGION" \
+                            --name "$CLUSTER_NAME"
+
+                        kubectl get nodes
+                    '''
+                }
+            }
+        }
+
+        stage('3. Validate ECR Image') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'access-key',
+                        variable: 'AWS_ACCESS_KEY_ID'
+                    ),
+                    string(
+                        credentialsId: 'secret-key',
+                        variable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+                        export AWS_DEFAULT_REGION="$AWS_REGION"
+                        export AWS_PAGER=""
+
+                        ACTUAL_ACCOUNT=$(aws sts get-caller-identity \
+                            --query Account --output text)
+
+                        if [ "$ACTUAL_ACCOUNT" != "$AWS_ACCOUNT_ID" ]; then
+                            echo "ERROR: AWS account mismatch."
+                            exit 1
+                        fi
+
+                        aws ecr describe-images \
+                            --registry-id "$AWS_ACCOUNT_ID" \
+                            --repository-name "$ECR_REPO_NAME" \
+                            --image-ids imageTag="$VERSION" \
+                            --region "$AWS_REGION"
+
+                        ECR_IMAGE_NAME="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}:${VERSION}"
+
+                        echo "Validated image: $ECR_IMAGE_NAME"
+
+                        test -f k8s_files/deployment.yaml
+                        test -f k8s_files/service.yaml
+                    '''
+                }
+            }
+        }
+
+        stage('4. Update Kubernetes Manifest') {
+            steps {
+                sh '''
+                    set -eu
+
+                    ECR_IMAGE_NAME="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}:${VERSION}"
+
+                    export ECR_IMAGE_NAME
+
+                    python3 - <<'PY'
+import os
+import re
+from pathlib import Path
+
+path = Path("k8s_files/deployment.yaml")
+content = path.read_text()
+image = os.environ["ECR_IMAGE_NAME"]
+
+pattern = re.compile(r"(?m)^([ \\t]*image:[ \\t]*).*$")
+updated, count = pattern.subn(
+    lambda match: match.group(1) + image,
+    content
+)
+
+if count == 0:
+    raise SystemExit("ERROR: No image field found in deployment.yaml")
+
+path.write_text(updated)
+print("Updated image to:", image)
+PY
+
+                    grep -n 'image:' k8s_files/deployment.yaml
+                '''
+            }
+        }
+
+        stage('5. Deploy to EKS') {
+            steps {
+                sh '''
+                    set -eu
+
+                    kubectl apply -f k8s_files/deployment.yaml
+                    kubectl apply -f k8s_files/service.yaml
+
+                    kubectl rollout status deployment/pandacloud-app \
+                        --timeout=180s
+                '''
+            }
+        }
+
+        stage('6. Verify Deployment') {
+            steps {
+                sh '''
+                    set -eu
+
+                    kubectl get deployments
+                    kubectl get pods -o wide
+                    kubectl get services
+
+                    kubectl rollout status deployment/pandacloud-app \
+                        --timeout=180s
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Application deployment completed successfully.'
+        }
+
+        failure {
+            echo 'Deployment failed. Check the Jenkins console output.'
+        }
+
+        always {
+            echo 'Review the deployment status and Jenkins console output.'
+        }
+    }
+}

@@ -1,0 +1,97 @@
+pipeline {
+    agent any
+
+    options {
+        timeout(time: 20, unit: 'MINUTES')
+        timestamps()
+    }
+
+    parameters {
+        string(name: 'CLUSTER_NAME', defaultValue: 'amazon-prime-cluster', description: 'EKS cluster name')
+        string(name: 'AWS_REGION', defaultValue: 'ap-southeast-2', description: 'AWS region of the cluster (Sydney)')
+        string(name: 'ARGOCD_VERSION', defaultValue: 'stable', description: 'ArgoCD manifest ref (use a tag like v2.x.y to pin)')
+        string(name: 'PROM_CHART_VERSION', defaultValue: '', description: 'kube-prometheus-stack chart version (empty = latest)')
+    }
+
+    environment {
+        AWS_ACCOUNT_ID        = '777035565509'
+        AWS_ACCESS_KEY_ID     = credentials('access-key')
+        AWS_SECRET_ACCESS_KEY = credentials('secret-key')
+        // Fallbacks so the first build after adding parameters still works
+        REGION                = "${params.AWS_REGION ?: 'ap-southeast-2'}"
+        ARGOCD_REF            = "${params.ARGOCD_VERSION ?: 'stable'}"
+    }
+
+    stages {
+        stage('Login to EKS') {
+            steps {
+                sh '''
+                    set -e
+                    ACTUAL_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+                    if [ "$ACTUAL_ACCOUNT" != "$AWS_ACCOUNT_ID" ]; then
+                        echo "Credentials belong to account $ACTUAL_ACCOUNT, expected $AWS_ACCOUNT_ID"
+                        exit 1
+                    fi
+                    aws eks --region "$REGION" update-kubeconfig --name "$CLUSTER_NAME"
+                    kubectl get nodes
+                '''
+            }
+        }
+
+        stage('Prometheus & Grafana') {
+            steps {
+                sh '''
+                    set -e
+                    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
+                    helm repo update
+
+                    # Clear a release left stuck by an aborted or failed earlier run
+                    if helm status stable -n prometheus 2>/dev/null | grep -Eq 'STATUS: (pending|failed)'; then
+                        echo "Removing stuck release 'stable'"
+                        helm uninstall stable -n prometheus
+                    fi
+
+                    VERSION_FLAG=""
+                    if [ -n "${PROM_CHART_VERSION}" ]; then VERSION_FLAG="--version ${PROM_CHART_VERSION}"; fi
+
+                    helm upgrade --install stable prometheus-community/kube-prometheus-stack \
+                        -n prometheus --create-namespace $VERSION_FLAG
+
+                    kubectl patch svc stable-kube-prometheus-sta-prometheus -n prometheus -p '{"spec": {"type": "LoadBalancer"}}'
+                    kubectl patch svc stable-grafana -n prometheus -p '{"spec": {"type": "LoadBalancer"}}'
+                '''
+            }
+        }
+
+        stage('ArgoCD') {
+            steps {
+                sh '''
+                    set -e
+                    kubectl create namespace argocd || true
+                    kubectl apply --server-side --force-conflicts -n argocd -f "https://raw.githubusercontent.com/argoproj/argo-cd/${ARGOCD_REF}/manifests/install.yaml"
+                    kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "LoadBalancer"}}'
+                '''
+            }
+        }
+
+        stage('Status') {
+            steps {
+                sh '''
+                    kubectl get pods -n prometheus || true
+                    kubectl get pods -n argocd || true
+                    kubectl get svc -n prometheus | grep -i loadbalancer || true
+                    kubectl get svc -n argocd | grep -i loadbalancer || true
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Applied. Pods take a few minutes to become Ready and load balancer hostnames 2-3 minutes to appear.'
+        }
+        failure {
+            echo 'Pipeline failed: check the stage logs above.'
+        }
+    }
+}

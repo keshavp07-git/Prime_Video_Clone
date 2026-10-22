@@ -1,0 +1,240 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION     = 'ap-southeast-2'
+        AWS_ACCOUNT_ID = '777035565509'
+        KUBECTL        = '/usr/local/bin/kubectl'
+    }
+
+    parameters {
+        string(
+            name: 'CLUSTER_NAME',
+            defaultValue: 'amazon-prime-cluster',
+            description: 'EKS cluster name in the new AWS account'
+        )
+
+        string(
+            name: 'ECR_REPO_NAME',
+            defaultValue: 'amazon-prime',
+            description: 'ECR repository to delete'
+        )
+
+        booleanParam(
+            name: 'DELETE_KMS_KEYS',
+            defaultValue: false,
+            description: 'Schedule explicitly listed KMS keys for deletion'
+        )
+
+        string(
+            name: 'KMS_KEY_IDS',
+            defaultValue: '',
+            description: 'Comma-separated KMS key IDs. Leave empty unless verified.'
+        )
+    }
+
+    stages {
+        stage('1. Verify AWS Account and Login to EKS') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'access-key',
+                           variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'secret-key',
+                           variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                        set -eu
+                        export AWS_DEFAULT_REGION="$AWS_REGION"
+                        export AWS_PAGER=""
+
+                        ACTUAL_ACCOUNT=$(aws sts get-caller-identity \
+                            --query Account --output text)
+
+                        echo "Authenticated AWS account: $ACTUAL_ACCOUNT"
+
+                        if [ "$ACTUAL_ACCOUNT" != "$AWS_ACCOUNT_ID" ]; then
+                            echo "ERROR: Expected AWS account $AWS_ACCOUNT_ID."
+                            echo "No cleanup will proceed."
+                            exit 1
+                        fi
+
+                        aws eks describe-cluster \
+                            --name "$CLUSTER_NAME" \
+                            --region "$AWS_REGION"
+
+                        aws eks update-kubeconfig \
+                            --region "$AWS_REGION" \
+                            --name "$CLUSTER_NAME"
+
+                        kubectl get nodes
+                    '''
+                }
+            }
+        }
+
+        stage('2. Cleanup Kubernetes Resources') {
+            steps {
+                input message: 'Confirm deletion of the selected Kubernetes resources in the new AWS account?', ok: 'Confirm Cleanup'
+
+                sh '''
+                    set -eu
+
+                    kubectl delete deployment pandacloud-app \
+                        --ignore-not-found=true
+
+                    kubectl delete service pandacloud-app \
+                        --ignore-not-found=true
+
+                    # Delete Argo CD resources only if the namespace exists.
+                    if kubectl get namespace argocd >/dev/null 2>&1; then
+                        kubectl delete -n argocd \
+                            -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml \
+                            --ignore-not-found=true || true
+
+                        kubectl delete namespace argocd \
+                            --ignore-not-found=true
+                    fi
+
+                    # Uninstall the specified Helm release if present.
+                    if helm status kube-stack -n prometheus >/dev/null 2>&1; then
+                        helm uninstall kube-stack -n prometheus
+                    fi
+
+                    if kubectl get namespace prometheus >/dev/null 2>&1; then
+                        kubectl delete namespace prometheus \
+                            --ignore-not-found=true
+                    fi
+
+                    # Remove local Helm repository entries if present.
+                    helm repo remove stable 2>/dev/null || true
+                    helm repo remove prometheus-community 2>/dev/null || true
+                '''
+            }
+        }
+
+        stage('3. Delete ECR Repository') {
+            steps {
+                input message: 'Confirm permanent deletion of this ECR repository and all its images?', ok: 'Delete ECR Repository'
+
+                withCredentials([
+                    string(credentialsId: 'access-key',
+                           variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'secret-key',
+                           variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                        set -eu
+                        export AWS_DEFAULT_REGION="$AWS_REGION"
+                        export AWS_PAGER=""
+
+                        ACTUAL_ACCOUNT=$(aws sts get-caller-identity \
+                            --query Account --output text)
+
+                        if [ "$ACTUAL_ACCOUNT" != "$AWS_ACCOUNT_ID" ]; then
+                            echo "ERROR: Wrong AWS account. Aborting."
+                            exit 1
+                        fi
+
+                        aws ecr describe-repositories \
+                            --registry-id "$AWS_ACCOUNT_ID" \
+                            --repository-names "$ECR_REPO_NAME" \
+                            --region "$AWS_REGION"
+
+                        aws ecr delete-repository \
+                            --registry-id "$AWS_ACCOUNT_ID" \
+                            --repository-name "$ECR_REPO_NAME" \
+                            --region "$AWS_REGION" \
+                            --force
+                    '''
+                }
+            }
+        }
+
+        stage('4. Schedule Selected KMS Keys for Deletion') {
+            when {
+                expression { params.DELETE_KMS_KEYS }
+            }
+            steps {
+                input message: 'Confirm scheduling the specified KMS keys for deletion after a 30-day waiting period?', ok: 'Schedule KMS Deletion'
+
+                withCredentials([
+                    string(credentialsId: 'access-key',
+                           variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'secret-key',
+                           variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                        set -eu
+                        export AWS_DEFAULT_REGION="$AWS_REGION"
+                        export AWS_PAGER=""
+
+                        ACTUAL_ACCOUNT=$(aws sts get-caller-identity \
+                            --query Account --output text)
+
+                        if [ "$ACTUAL_ACCOUNT" != "$AWS_ACCOUNT_ID" ]; then
+                            echo "ERROR: Wrong AWS account. Aborting."
+                            exit 1
+                        fi
+
+                        if [ -z "$KMS_KEY_IDS" ]; then
+                            echo "ERROR: No KMS key IDs supplied."
+                            exit 1
+                        fi
+
+                        OLD_IFS="$IFS"
+                        IFS=','
+                        set -- $KMS_KEY_IDS
+                        IFS="$OLD_IFS"
+
+                        for key in "$@"; do
+                            key=$(printf '%s' "$key" | xargs)
+
+                            [ -n "$key" ] || continue
+
+                            echo "Checking KMS key: $key"
+
+                            KEY_ACCOUNT=$(aws kms describe-key \
+                                --key-id "$key" \
+                                --region "$AWS_REGION" \
+                                --query 'KeyMetadata.AWSAccountId' \
+                                --output text)
+
+                            KEY_MANAGER=$(aws kms describe-key \
+                                --key-id "$key" \
+                                --region "$AWS_REGION" \
+                                --query 'KeyMetadata.KeyManager' \
+                                --output text)
+
+                            if [ "$KEY_ACCOUNT" != "$AWS_ACCOUNT_ID" ]; then
+                                echo "ERROR: Key $key belongs to another account."
+                                exit 1
+                            fi
+
+                            if [ "$KEY_MANAGER" != "CUSTOMER" ]; then
+                                echo "ERROR: Key $key is not customer-managed."
+                                exit 1
+                            fi
+
+                            aws kms schedule-key-deletion \
+                                --key-id "$key" \
+                                --pending-window-in-days 30 \
+                                --region "$AWS_REGION"
+                        done
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Cleanup pipeline completed successfully.'
+        }
+        failure {
+            echo 'Cleanup pipeline failed or was interrupted. Review the console output and AWS resources.'
+        }
+        always {
+            echo 'Review all deletion results before considering cleanup complete.'
+        }
+    }
+}
